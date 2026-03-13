@@ -1,24 +1,23 @@
-import torch
+import numpy as np
 import matplotlib.pyplot as plt
 
-torch.manual_seed(0)
+np.random.seed(0)
 
 T = 1.0
 
-H = torch.tensor([[0.1, 0.0], [0.0, 0.2]])
-M = torch.eye(2)
-C = torch.eye(2)
-D = torch.eye(2)
-R = torch.eye(2)
-sigma = 0.3 * torch.eye(2)
+H = np.array([[0.1, 0.0], [0.0, 0.2]])
+M = np.eye(2)
+C = np.eye(2)
+D = np.eye(2)
+R = np.eye(2)
+sigma = 0.3 * np.eye(2)
 
-x0 = torch.tensor([1.0, 1.0])
+x0 = np.array([1.0, 1.0])
 
 
 class LQR:
 
     def __init__(self, H, M, C, D, R, sigma, T):
-
         self.H = H
         self.M = M
         self.C = C
@@ -26,19 +25,18 @@ class LQR:
         self.R = R
         self.sigma = sigma
         self.T = T
-        self.Dinv = torch.linalg.inv(D)
+        self.Dinv = np.linalg.inv(D)
 
-    # Riccati solver
+    # Riccati ODE solver (backward Euler)
     def solve_riccati(self, t_grid):
 
         N = len(t_grid)
         dt = t_grid[1] - t_grid[0]
 
-        S = torch.zeros(N, 2, 2)
+        S = np.zeros((N, 2, 2))
         S[-1] = self.R
 
         for i in reversed(range(N - 1)):
-
             S_next = S[i + 1]
 
             drift = (
@@ -53,39 +51,31 @@ class LQR:
         self.t_grid = t_grid
 
     def get_S(self, t):
-
-        idx = torch.argmin(torch.abs(self.t_grid - t))
+        idx = np.argmin(np.abs(self.t_grid - t))
         return self.S[idx]
 
-    # value function
+    # value function (including integral term)
     def value_function(self, t, x):
 
         S = self.get_S(t)
+        value = x.T @ S @ x
 
-        value = x @ S @ x
+        idx = np.argmin(np.abs(self.t_grid - t))
 
-        idx = torch.argmin(torch.abs(self.t_grid - t))
-
-        trace_vals = torch.stack([
-            torch.trace(self.sigma @ self.sigma.T @ S_i)
+        trace_vals = [
+            np.trace(self.sigma @ self.sigma.T @ S_i)
             for S_i in self.S[idx:]
-        ])
+        ]
 
-        dt = self.t_grid[1] - self.t_grid[0]
-
-        integral = torch.sum((trace_vals[:-1] + trace_vals[1:]) * 0.5 * dt)
+        integral = np.trapezoid(trace_vals, self.t_grid[idx:])
 
         return value + integral
 
-    # control
-    def optimal_control(self, t, X):
-
+    # optimal control
+    def optimal_control(self, t, x):
         S = self.get_S(t)
+        return -self.Dinv @ self.M.T @ S @ x
 
-        return -(X @ S.T @ self.M @ self.Dinv.T)
-
-
-# ===== 向量化 Monte Carlo =====
 
 def simulate_LQR(lqr, x0, N, MC):
 
@@ -93,56 +83,56 @@ def simulate_LQR(lqr, x0, N, MC):
     dt = T / N
     d = len(x0)
 
-    # MC paths
-    X = x0.repeat(MC, 1)
+    cost = np.zeros(MC)
 
-    running_cost = torch.zeros(MC)
+    for m in range(MC):
 
-    for n in range(N):
+        X = x0.copy()
+        running_cost = 0
 
-        t = n * dt
+        for n in range(N):
 
-        S = lqr.get_S(torch.tensor(t))
+            t = n * dt
 
-        # optimal control
-        u = -(X @ S.T)
+            u = lqr.optimal_control(t, X)
 
-        drift = X @ lqr.H.T + u @ lqr.M.T
+            drift = lqr.H @ X + lqr.M @ u
 
-        dW = torch.sqrt(torch.tensor(dt)) * torch.randn(MC, d)
+            dW = np.sqrt(dt) * np.random.randn(d)
 
-        running_cost += (
-            torch.sum((X @ lqr.C) * X, dim=1)
-            + torch.sum((u @ lqr.D) * u, dim=1)
-        ) * dt
+            # running cost
+            running_cost += (
+                X.T @ lqr.C @ X +
+                u.T @ lqr.D @ u
+            ) * dt
 
-        X = X + drift * dt + dW @ lqr.sigma.T
+            # state update
+            X = X + drift * dt + lqr.sigma @ dW
 
-    terminal_cost = torch.sum((X @ lqr.R) * X, dim=1)
+        terminal_cost = X.T @ lqr.R @ X
 
-    cost = running_cost + terminal_cost
+        cost[m] = running_cost + terminal_cost
 
-    return torch.mean(cost)
+    return np.mean(cost)
 
 
-# ===== Create LQR =====
-
+# create LQR
 lqr = LQR(H, M, C, D, R, sigma, T)
 
-t_grid = torch.linspace(0, T, 5000)
-
+t_grid = np.linspace(0, T, 5000)
 lqr.solve_riccati(t_grid)
 
-true_value = lqr.value_function(torch.tensor(0.0), x0)
+true_value = lqr.value_function(0, x0)
 
-print("Value function:", true_value.item())
+print("Value function:", true_value)
 
 
 # ======================
 # Experiment 1
+# vary time steps
 # ======================
 
-MC = 100000
+MC = int(1e5)
 
 time_steps = [1, 10, 50, 100, 500, 1000, 5000]
 
@@ -154,9 +144,9 @@ for N in time_steps:
 
     est = simulate_LQR(lqr, x0, N, MC)
 
-    error = torch.abs(est - true_value)
+    error = abs(est - true_value)
 
-    errors_time.append(error.item())
+    errors_time.append(error)
 
 plt.figure()
 
@@ -167,13 +157,14 @@ plt.ylabel("error")
 
 plt.title("Error vs time discretisation")
 
-plt.grid(True)
+plt.grid(True, which="both", ls="-", alpha=0.2)
 
 plt.show()
 
 
 # ======================
 # Experiment 2
+# vary MC samples
 # ======================
 
 N = 5000
@@ -188,9 +179,9 @@ for MC in MC_samples:
 
     est = simulate_LQR(lqr, x0, N, MC)
 
-    error = torch.abs(est - true_value)
+    error = abs(est - true_value)
 
-    errors_MC.append(error.item())
+    errors_MC.append(error)
 
 plt.figure()
 
@@ -201,6 +192,6 @@ plt.ylabel("error")
 
 plt.title("Error vs Monte Carlo samples")
 
-plt.grid(True)
+plt.grid(True, which="both", ls="-", alpha=0.2)
 
 plt.show()
