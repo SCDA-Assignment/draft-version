@@ -169,7 +169,7 @@ plt.title("Error vs time discretisation")
 
 plt.grid(True)
 
-plt.show()
+plt.savefig("Error vs time discretisation.png")
 
 
 # ======================
@@ -203,4 +203,4 @@ plt.title("Error vs Monte Carlo samples")
 
 plt.grid(True)
 
-plt.show()
+plt.savefig("Error vs Monte Carlo samples.png")
