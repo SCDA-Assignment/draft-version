@@ -2,20 +2,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
-import numpy as np
-from torch.autograd import Variable
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib import cm
 
 # =========================================================
 # DEVICE / SEED
 # =========================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 torch.manual_seed(0)
-np.random.seed(0)
 
 # =========================================================
-# 1. YOUR FFN: used for control a(t,x)
+# 1. FFN: used directly for control a(t,x)
 # =========================================================
 class FFN(nn.Module):
     def __init__(self, sizes, activation=nn.ReLU, output_activation=nn.Identity, batch_norm=False):
@@ -33,59 +28,32 @@ class FFN(nn.Module):
 
         self.net = nn.Sequential(*layers)
 
-    def freeze(self):
-        for p in self.parameters():
-            p.requires_grad = False
-
-    def unfreeze(self):
-        for p in self.parameters():
-            p.requires_grad = True
-
     def forward(self, x):
         return self.net(x)
 
 # =========================================================
-# 2. NOTEBOOK-STYLE NET: used for value v(t,x)
+# 2. Net: used for value v(t,x)
 # input dim = 3 = (t, x1, x2)
 # output dim = 1
 # =========================================================
 class Net(nn.Module):
     def __init__(self, n_layer, n_hidden, dim):
-        super(Net, self).__init__()
-        self.dim = dim
+        super().__init__()
         self.input_layer = nn.Linear(dim, n_hidden)
         self.hidden_layers = nn.ModuleList([nn.Linear(n_hidden, n_hidden) for _ in range(n_layer)])
         self.output_layer = nn.Linear(n_hidden, 1)
+
+    def act(self, x):
+        return x * torch.sigmoid(x)  # swish
 
     def forward(self, x):
         o = self.act(self.input_layer(x))
         for li in self.hidden_layers:
             o = self.act(li(o))
-        out = self.output_layer(o)
-        return out
-
-    def act(self, x):
-        return x * torch.sigmoid(x)  # swish
+        return self.output_layer(o)
 
 # =========================================================
-# 3. ACTOR: wrapper around FFN
-# =========================================================
-class Actor(nn.Module):
-    def __init__(self, hidden_sizes=(64, 64)):
-        super().__init__()
-        sizes = [3] + list(hidden_sizes) + [2]
-        self.net = FFN(
-            sizes=sizes,
-            activation=nn.Tanh,
-            output_activation=nn.Identity,
-            batch_norm=False
-        )
-
-    def forward(self, tx):
-        return self.net(tx)
-
-# =========================================================
-# 4. AUTOGRAD UTILS
+# 3. AUTOGRAD UTILS
 # =========================================================
 def grad(outputs, inputs):
     return torch.autograd.grad(
@@ -126,18 +94,20 @@ def diffusion_term_from_tx(v, tx, sigma):
     return 0.5 * torch.einsum('ij,bij->b', A, Hx).reshape(-1, 1)
 
 # =========================================================
-# 5. RICCATI SOLVER: Exercise 1.1 benchmark
+# 4. RICCATI SOLVER: exact benchmark
 # =========================================================
 class RiccatiSolver:
     def __init__(self, H, M, C, D, R, sigma, T, device):
-        self.H = H
-        self.M = M
-        self.C = C
-        self.D = D
-        self.R = R
-        self.sigma = sigma
+        self.H = H.float()
+        self.M = M.float()
+        self.C = C.float()
+        self.D = D.float()
+        self.R = R.float()
+        self.sigma = sigma.float()
         self.T = T
         self.device = device
+
+        self.Dinv = torch.linalg.inv(self.D)
         self.S_list = []
         self.dt = None
 
@@ -147,7 +117,7 @@ class RiccatiSolver:
         S_rev = [S.clone()]
 
         for _ in range(N):
-            dS = -2 * self.H.T @ S + S @ self.M @ torch.inverse(self.D) @ self.M.T @ S - self.C
+            dS = -2 * self.H.T @ S + S @ self.M @ self.Dinv @ self.M.T @ S - self.C
             S = S - self.dt * dS
             S_rev.append(S.clone())
 
@@ -160,8 +130,8 @@ class RiccatiSolver:
 
     def value(self, t_scalar, x):
         """
-        v(t,x) = x^T S(t) x + ∫_t^T tr(sigma sigma^T S(r)) dr
-        x shape: (batch, 2)
+        x: (batch, 2)
+        returns: (batch, 1)
         """
         idx = int(float(t_scalar) / self.T * (len(self.S_list) - 1))
         idx = max(0, min(idx, len(self.S_list) - 1))
@@ -179,19 +149,23 @@ class RiccatiSolver:
 
     def control(self, t_scalar, x):
         """
-        a*(t,x) = -D^{-1} M^T S(t) x
+        x: (batch, 2)
+        returns: (batch, 2)
         """
         S_t = self.S(t_scalar)
-        K = torch.inverse(self.D) @ self.M.T @ S_t
+        K = self.Dinv @ self.M.T @ S_t
         return -(x @ K.T)
 
 # =========================================================
-# 6. PIA PDE / HAMILTONIAN
+# 5. PIA OBJECT
+# critic minimizes:
+#   R(theta) = R_eqn(theta) + R_boundary(theta)
+# actor minimizes Hamiltonian
 # =========================================================
 class LQR_PIA:
     def __init__(self, critic, actor, H, M, C, D, R, sigma, T, device):
-        self.critic = critic
-        self.actor = actor
+        self.critic = critic   # Net
+        self.actor = actor     # FFN
         self.H = H
         self.M = M
         self.C = C
@@ -213,7 +187,6 @@ class LQR_PIA:
         vt = dv_dtx[:, 0:1]
         x_var = tx[:, 1:3]
         vx = dv_dtx[:, 1:3]
-
         a = self.actor(tx)
 
         drift = x_var @ self.H.T + a @ self.M.T
@@ -225,19 +198,29 @@ class LQR_PIA:
         residual = vt + diff + torch.sum(vx * drift, dim=1, keepdim=True) + xCx + aDa
         return residual
 
-    def terminal_loss(self, size):
+    def terminal_residual(self, size):
         x = -2 + 4 * torch.rand(size, 2, device=self.device)
         t = torch.ones(size, 1, device=self.device) * self.T
         tx = torch.cat([t, x], dim=1)
 
         vT = self.critic(tx)
         target = torch.sum((x @ self.R) * x, dim=1, keepdim=True)
-        return (vT - target) ** 2
+        return vT - target
 
-    def value_loss(self, size=2**8):
-        pde_err = self.pde_residual(size) ** 2
-        term_err = self.terminal_loss(size)
-        return torch.mean(pde_err + term_err)
+    def value_objective(self, size=2**8, return_parts=False):
+        """
+        R(theta) = R_eqn(theta) + R_boundary(theta)
+        """
+        eqn_res = self.pde_residual(size)
+        bdry_res = self.terminal_residual(size)
+
+        R_eqn = torch.mean(eqn_res ** 2)
+        R_boundary = torch.mean(bdry_res ** 2)
+        R_total = R_eqn + R_boundary
+
+        if return_parts:
+            return R_total, R_eqn, R_boundary
+        return R_total
 
     def hamiltonian(self, size=2**8):
         t = torch.rand(size, 1, device=self.device) * self.T
@@ -264,7 +247,9 @@ class LQR_PIA:
         return torch.mean(Hamil)
 
 # =========================================================
-# 7. TRAINER
+# 6. TRAINER
+# no numpy
+# no MSE
 # =========================================================
 class TrainPIA:
     def __init__(self, critic, actor, pia, ric, device):
@@ -274,31 +259,29 @@ class TrainPIA:
         self.ric = ric
         self.device = device
 
-        self.H_list = []
-        self.v_mse_list = []
-        self.a_mse_list = []
-        self.value_loss_hist = []
-        self.policy_loss_hist = []
+        # outer-iteration summaries
+        self.outer_idx = []
+        self.min_total_obj_list = []
+        self.min_eqn_obj_list = []
+        self.min_boundary_obj_list = []
+        self.min_hamiltonian_list = []
 
-    def evaluate_metrics(self, n_test=300):
+        self.value_abs_error_list = []
+        self.action_abs_error_list = []
+
+        # epoch-level histories for DGM-style plots
+        self.value_epoch_hist = []
+        self.total_loss_hist = []
+        self.pde_loss_hist = []
+        self.terminal_loss_hist = []
+
+        self.error_eval_epoch_hist = []
+        self.value_mae_hist = []
+
+    def evaluate_absolute_errors(self, n_test=300):
         x = -2 + 4 * torch.rand(n_test, 2, device=self.device)
         t = torch.zeros(n_test, 1, device=self.device)
         tx = torch.cat([t, x], dim=1)
-
-        tx_var = tx.clone().detach().requires_grad_(True)
-        x_var = tx_var[:, 1:3]
-
-        v = self.critic(tx_var)
-        dv_dtx = grad(v, tx_var)
-        vx = dv_dtx[:, 1:3]
-        a = self.actor(tx_var)
-
-        H_eval = (
-            torch.sum(vx * (x_var @ self.pia.H.T), dim=1, keepdim=True)
-            + torch.sum(vx * (a @ self.pia.M.T), dim=1, keepdim=True)
-            + torch.sum((x_var @ self.pia.C) * x_var, dim=1, keepdim=True)
-            + torch.sum((a @ self.pia.D) * a, dim=1, keepdim=True)
-        ).mean().item()
 
         with torch.no_grad():
             v_true = self.ric.value(0.0, x)
@@ -307,201 +290,326 @@ class TrainPIA:
             v_nn = self.critic(tx)
             a_nn = self.actor(tx)
 
-            v_mse = torch.mean((v_nn - v_true) ** 2).item()
-            a_mse = torch.mean((a_nn - a_true) ** 2).item()
+            value_abs_error = torch.mean(torch.abs(v_nn - v_true)).item()
+            action_abs_error = torch.mean(torch.abs(a_nn - a_true)).item()
 
-        return H_eval, v_mse, a_mse
+        return value_abs_error, action_abs_error
 
-    def train(self, outer_iters=8, value_steps=3000, policy_steps=1500, lr_v=0.002, lr_a=0.001):
+    def compute_value_mae(self, n_test=400):
+        x = -2 + 4 * torch.rand(n_test, 2, device=self.device)
+        t = torch.rand(n_test, 1, device=self.device) * self.pia.T
+        tx = torch.cat([t, x], dim=1)
+
+        with torch.no_grad():
+            v_nn = self.critic(tx)
+
+            v_true_list = []
+            for i in range(n_test):
+                ti = float(t[i].item())
+                xi = x[i:i+1]
+                v_true_list.append(self.ric.value(ti, xi))
+            v_true = torch.cat(v_true_list, dim=0)
+
+            mae = torch.mean(torch.abs(v_nn - v_true)).item()
+
+        return mae
+
+    def train(self, outer_iters=8, value_steps=3000, policy_steps=1500,
+              lr_v=0.002, lr_a=0.001, eval_every=250):
         opt_v = optim.Adam(self.critic.parameters(), lr=lr_v)
         opt_a = optim.Adam(self.actor.parameters(), lr=lr_a)
+
+        global_value_epoch = 0
 
         for k in range(outer_iters):
             print(f"\n=== Outer Iteration {k+1}/{outer_iters} ===")
 
-            # value update
+            # -------------------------
+            # critic update
+            # -------------------------
             self.actor.eval()
             self.critic.train()
 
+            min_total_obj = float("inf")
+            min_eqn_obj = float("inf")
+            min_boundary_obj = float("inf")
+
             for e in range(value_steps):
+                global_value_epoch += 1
+
                 opt_v.zero_grad()
-                loss_v = self.pia.value_loss(size=2**8)
-                loss_v.backward()
+                total_obj, eqn_obj, boundary_obj = self.pia.value_objective(size=2**8, return_parts=True)
+                total_obj.backward()
                 opt_v.step()
 
-                if e % 300 == 299:
-                    print(f"Value step {e+1} | loss = {loss_v.item():.6f}")
-                    self.value_loss_hist.append(loss_v.item())
+                min_total_obj = min(min_total_obj, total_obj.item())
+                min_eqn_obj = min(min_eqn_obj, eqn_obj.item())
+                min_boundary_obj = min(min_boundary_obj, boundary_obj.item())
 
-            # policy update
+                self.value_epoch_hist.append(global_value_epoch)
+                self.total_loss_hist.append(total_obj.item())
+                self.pde_loss_hist.append(eqn_obj.item())
+                self.terminal_loss_hist.append(boundary_obj.item())
+
+                if global_value_epoch % eval_every == 0:
+                    value_mae = self.compute_value_mae(n_test=400)
+                    self.error_eval_epoch_hist.append(global_value_epoch)
+                    self.value_mae_hist.append(value_mae)
+
+                if e % 300 == 299:
+                    print(
+                        f"Value step {e+1} | "
+                        f"R_total = {total_obj.item():.6f}, "
+                        f"R_eqn = {eqn_obj.item():.6f}, "
+                        f"R_boundary = {boundary_obj.item():.6f}"
+                    )
+
+            # -------------------------
+            # actor update
+            # -------------------------
             self.critic.eval()
             for p in self.critic.parameters():
                 p.requires_grad = False
 
             self.actor.train()
+            min_hamiltonian = float("inf")
+
             for e in range(policy_steps):
                 opt_a.zero_grad()
-                loss_a = self.pia.hamiltonian(size=2**8)
-                loss_a.backward()
+                hamil = self.pia.hamiltonian(size=2**8)
+                hamil.backward()
                 opt_a.step()
 
+                min_hamiltonian = min(min_hamiltonian, hamil.item())
+
                 if e % 300 == 299:
-                    print(f"Policy step {e+1} | H = {loss_a.item():.6f}")
-                    self.policy_loss_hist.append(loss_a.item())
+                    print(f"Policy step {e+1} | Hamiltonian = {hamil.item():.6f}")
 
             for p in self.critic.parameters():
                 p.requires_grad = True
 
-            H_eval, v_mse, a_mse = self.evaluate_metrics()
-            self.H_list.append(H_eval)
-            self.v_mse_list.append(v_mse)
-            self.a_mse_list.append(a_mse)
+            # -------------------------
+            # outer summary
+            # -------------------------
+            value_abs_error, action_abs_error = self.evaluate_absolute_errors()
 
-            print(f"Eval | H = {H_eval:.6f}, V_MSE = {v_mse:.6f}, A_MSE = {a_mse:.6f}")
+            self.outer_idx.append(k + 1)
+            self.min_total_obj_list.append(min_total_obj)
+            self.min_eqn_obj_list.append(min_eqn_obj)
+            self.min_boundary_obj_list.append(min_boundary_obj)
+            self.min_hamiltonian_list.append(min_hamiltonian)
+            self.value_abs_error_list.append(value_abs_error)
+            self.action_abs_error_list.append(action_abs_error)
 
-# =========================================================
-# 8. DEMO FOR VALUE SURFACE
-# =========================================================
-class DemoValue:
-    def __init__(self, critic, ric, T, nt=80, nx=80, x2_fixed=0.0, device='cpu'):
-        self.critic = critic
-        self.ric = ric
-        self.T = T
-        self.nt = nt
-        self.nx = nx
-        self.x2_fixed = x2_fixed
-        self.device = device
-
-        self.t_range = np.linspace(0, T, nt)
-        self.x1_range = np.linspace(-2, 2, nx)
-
-    def get_solution(self):
-        self.est_solution = []
-        self.true_solution = []
-
-        for t in self.t_range:
-            for x1 in self.x1_range:
-                x = torch.tensor([[x1, self.x2_fixed]], dtype=torch.float32, device=self.device)
-                tx = torch.tensor([[t, x1, self.x2_fixed]], dtype=torch.float32, device=self.device)
-
-                with torch.no_grad():
-                    v_est = self.critic(tx).item()
-                    v_true = self.ric.value(t, x).item()
-
-                self.est_solution.append(v_est)
-                self.true_solution.append(v_true)
-
-        self.est_solution = np.array(self.est_solution).reshape(self.nt, self.nx)
-        self.true_solution = np.array(self.true_solution).reshape(self.nt, self.nx)
-
-    def plot_mesh(self):
-        t, x1 = np.meshgrid(self.t_range, self.x1_range, indexing='ij')
-
-        fig1 = plt.figure(figsize=(8, 6))
-        ax1 = fig1.add_subplot(111, projection='3d')
-        ax1.plot_surface(t, x1, self.est_solution, cmap=cm.RdYlBu_r, edgecolor='none')
-        ax1.set_title('Estimated value surface')
-        ax1.set_xlabel('t')
-        ax1.set_ylabel('x1')
-        ax1.set_zlabel('v')
-        plt.savefig("fig4_value_surface.png", dpi=200, bbox_inches='tight')
-        plt.close()
-
-        fig2 = plt.figure(figsize=(8, 6))
-        ax2 = fig2.add_subplot(111, projection='3d')
-        ax2.plot_surface(t, x1, self.est_solution - self.true_solution, cmap=cm.RdYlBu_r, edgecolor='none')
-        ax2.set_title('Value error surface')
-        ax2.set_xlabel('t')
-        ax2.set_ylabel('x1')
-        ax2.set_zlabel('error')
-        plt.savefig("fig5_value_error_surface.png", dpi=200, bbox_inches='tight')
-        plt.close()
+            print(
+                f"Outer {k+1} summary | "
+                f"min R_total = {min_total_obj:.6e}, "
+                f"min R_eqn = {min_eqn_obj:.6e}, "
+                f"min R_boundary = {min_boundary_obj:.6e}, "
+                f"min Hamiltonian = {min_hamiltonian:.6e}, "
+                f"value abs error = {value_abs_error:.6e}, "
+                f"action abs error = {action_abs_error:.6e}"
+            )
 
 # =========================================================
-# 9. PLOTTING THREE STANDARD FIGURES
+# 7. STANDARD FIGURES
+# 上图：原图 + inset
+# 下图：error
 # =========================================================
 def plot_all_results(critic, actor, ric, trainer, device):
-    """
-    Standard 3 figures for submission:
-    1) value function comparison
-    2) control comparison
-    3) convergence plot
-    """
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
 
-    # -------------------------------------------------
-    # Fixed slice: t = 0, x2 = 0, vary x1 in [-2, 2]
-    # -------------------------------------------------
-    x1_grid = torch.linspace(-2, 2, 200, device=device).reshape(-1, 1)
+    x1_grid = torch.linspace(-2, 2, 400, device=device).reshape(-1, 1)
     x2_grid = torch.zeros_like(x1_grid)
     t_grid = torch.zeros_like(x1_grid)
 
-    x = torch.cat([x1_grid, x2_grid], dim=1)           # (N, 2)
-    tx = torch.cat([t_grid, x1_grid, x2_grid], dim=1)  # (N, 3)
+    x = torch.cat([x1_grid, x2_grid], dim=1)
+    tx = torch.cat([t_grid, x1_grid, x2_grid], dim=1)
 
     with torch.no_grad():
-        v_nn = critic(tx).cpu().numpy().flatten()
-        a_nn = actor(tx).cpu().numpy()
-        v_true = ric.value(0.0, x).cpu().numpy().flatten()
-        a_true = ric.control(0.0, x).cpu().numpy()
+        v_nn = critic(tx).squeeze(1).cpu()
+        a_nn = actor(tx).cpu()
+        v_true = ric.value(0.0, x).squeeze(1).cpu()
+        a_true = ric.control(0.0, x).cpu()
 
-    x1_np = x1_grid.cpu().numpy().flatten()
+    eps = 1e-12
+    v_abs_err = torch.abs(v_nn - v_true) + eps
+    a1_abs_err = torch.abs(a_nn[:, 0] - a_true[:, 0]) + eps
+    a2_abs_err = torch.abs(a_nn[:, 1] - a_true[:, 1]) + eps
 
-    # -------------------------------------------------
-    # Figure 1: value function comparison
-    # -------------------------------------------------
-    plt.figure(figsize=(6.5, 4.5))
-    plt.plot(x1_np, v_true, label='Exact value')
-    plt.plot(x1_np, v_nn, '--', label='Learned value')
-    plt.title('Value Function Comparison')
-    plt.xlabel(r'$x_1$  (with $t=0,\ x_2=0$)')
-    plt.ylabel(r'$v(0, x_1, 0)$')
-    plt.legend()
-    plt.grid(True)
+    x1_list = x1_grid.squeeze(1).cpu().tolist()
+    v_true_list = v_true.tolist()
+    v_nn_list = v_nn.tolist()
+    a1_true_list = a_true[:, 0].tolist()
+    a1_nn_list = a_nn[:, 0].tolist()
+    a2_true_list = a_true[:, 1].tolist()
+    a2_nn_list = a_nn[:, 1].tolist()
+
+    # =====================================================
+    # Figure 1: value comparison
+    # =====================================================
+    fig, axes = plt.subplots(
+        2, 1, figsize=(7, 7),
+        gridspec_kw={'height_ratios': [3, 1.5]},
+        sharex=True
+    )
+
+    axes[0].plot(x1_list, v_true_list, label='Exact value', linewidth=2)
+    axes[0].plot(x1_list, v_nn_list, '--', label='Learned value', linewidth=2)
+    axes[0].set_title('Value Function Comparison')
+    axes[0].set_ylabel(r'$v(0, x_1, 0)$')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # inset 放大
+    axins_v = inset_axes(axes[0], width="38%", height="38%", loc='upper right')
+    axins_v.plot(x1_list, v_true_list, linewidth=2)
+    axins_v.plot(x1_list, v_nn_list, '--', linewidth=2)
+
+    # 可调放大范围
+    x1_left_v, x1_right_v = -0.3, 0.3
+    y1_v, y2_v = 0.20, 0.24
+
+    axins_v.set_xlim(x1_left_v, x1_right_v)
+    axins_v.set_ylim(y1_v, y2_v)
+    axins_v.grid(True)
+    axins_v.tick_params(labelsize=8)
+
+    mark_inset(axes[0], axins_v, loc1=2, loc2=4, fc="none", ec="0.5")
+
+    # 下图 error
+    axes[1].plot(x1_list, v_abs_err.tolist(), linewidth=2)
+    axes[1].set_xlabel(r'$x_1$  (with $t=0,\ x_2=0$)')
+    axes[1].set_ylabel(r'$|error|$')
+    axes[1].set_title('Absolute Error in Value Function')
+    axes[1].grid(True, which='both')
+
     plt.tight_layout()
-    plt.savefig("fig1_value_comparison.png", dpi=200, bbox_inches='tight')
+    plt.savefig("fig1_value_comparison_inset.png", dpi=220, bbox_inches='tight')
     plt.close()
 
-    # -------------------------------------------------
+    # =====================================================
     # Figure 2: control comparison
-    # -------------------------------------------------
-    plt.figure(figsize=(7.0, 4.8))
-    plt.plot(x1_np, a_true[:, 0], label='Exact $a_1$')
-    plt.plot(x1_np, a_nn[:, 0], '--', label='Learned $a_1$')
-    plt.plot(x1_np, a_true[:, 1], label='Exact $a_2$')
-    plt.plot(x1_np, a_nn[:, 1], '--', label='Learned $a_2$')
-    plt.title('Control Comparison')
-    plt.xlabel(r'$x_1$  (with $t=0,\ x_2=0$)')
-    plt.ylabel(r'$a(0, x_1, 0)$')
-    plt.legend()
-    plt.grid(True)
+    # =====================================================
+    fig, axes = plt.subplots(
+        2, 1, figsize=(7, 7),
+        gridspec_kw={'height_ratios': [3, 1.5]},
+        sharex=True
+    )
+
+    axes[0].plot(x1_list, a1_true_list, label='Exact $a_1$', linewidth=2)
+    axes[0].plot(x1_list, a1_nn_list, '--', label='Learned $a_1$', linewidth=2)
+    axes[0].plot(x1_list, a2_true_list, label='Exact $a_2$', linewidth=2)
+    axes[0].plot(x1_list, a2_nn_list, '--', label='Learned $a_2$', linewidth=2)
+    axes[0].set_title('Control Comparison')
+    axes[0].set_ylabel(r'$a(0, x_1, 0)$')
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # inset 放大
+    axins_a = inset_axes(axes[0], width="38%", height="38%", loc='upper right')
+    axins_a.plot(x1_list, a1_true_list, linewidth=2)
+    axins_a.plot(x1_list, a1_nn_list, '--', linewidth=2)
+    axins_a.plot(x1_list, a2_true_list, linewidth=2)
+    axins_a.plot(x1_list, a2_nn_list, '--', linewidth=2)
+
+    # 可调放大范围
+    x1_left_a, x1_right_a = -0.3, 0.3
+    y1_a, y2_a = -0.02, 0.02
+
+    axins_a.set_xlim(x1_left_a, x1_right_a)
+    axins_a.set_ylim(y1_a, y2_a)
+    axins_a.grid(True)
+    axins_a.tick_params(labelsize=8)
+
+    mark_inset(axes[0], axins_a, loc1=2, loc2=4, fc="none", ec="0.5")
+
+    # 下图 error
+    axes[1].plot(x1_list, a1_abs_err.tolist(), label=r'$|a_1-a_1^*|$', linewidth=2)
+    axes[1].plot(x1_list, a2_abs_err.tolist(), label=r'$|a_2-a_2^*|$', linewidth=2)
+    axes[1].set_xlabel(r'$x_1$  (with $t=0,\ x_2=0$)')
+    axes[1].set_ylabel(r'$|error|$')
+    axes[1].set_title('Absolute Error in Control')
+    axes[1].legend()
+    axes[1].grid(True, which='both')
+
     plt.tight_layout()
-    plt.savefig("fig2_control_comparison.png", dpi=200, bbox_inches='tight')
+    plt.savefig("fig2_control_comparison_inset.png", dpi=220, bbox_inches='tight')
     plt.close()
 
-    # -------------------------------------------------
-    # Figure 3: convergence plot
-    # -------------------------------------------------
-    outer_idx = np.arange(1, len(trainer.v_mse_list) + 1)
+    # =====================================================
+    # Figure 3: minimum objective history
+    # 保持不变
+    # =====================================================
+    fig, axes = plt.subplots(2, 1, figsize=(7, 7), sharex=True)
 
-    plt.figure(figsize=(6.5, 4.5))
-    plt.plot(outer_idx, trainer.v_mse_list, marker='o', label='Value MSE')
-    plt.plot(outer_idx, trainer.a_mse_list, marker='s', label='Action MSE')
-    plt.title('Convergence Across Outer Iterations')
-    plt.xlabel('Outer iteration')
-    plt.ylabel('MSE')
-    plt.legend()
-    plt.grid(True)
+    axes[0].plot(trainer.outer_idx, trainer.min_total_obj_list, marker='o', linewidth=2, label='min $R(\\theta)$')
+    axes[0].plot(trainer.outer_idx, trainer.min_eqn_obj_list, marker='s', linewidth=2, label='min $R_{eqn}(\\theta)$')
+    axes[0].plot(trainer.outer_idx, trainer.min_boundary_obj_list, marker='^', linewidth=2, label='min $R_{boundary}(\\theta)$')
+    axes[0].set_yscale('log')
+    axes[0].set_ylabel('Objective value')
+    axes[0].set_title('Minimum Critic Objective Across Outer Iterations')
+    axes[0].legend()
+    axes[0].grid(True, which='both')
+
+    axes[1].plot(trainer.outer_idx, trainer.min_hamiltonian_list, marker='o', linewidth=2, label='min Hamiltonian')
+    axes[1].set_yscale('log')
+    axes[1].set_xlabel('Outer iteration')
+    axes[1].set_ylabel('Hamiltonian')
+    axes[1].set_title('Minimum Hamiltonian Across Outer Iterations')
+    axes[1].legend()
+    axes[1].grid(True, which='both')
+
     plt.tight_layout()
-    plt.savefig("fig3_convergence.png", dpi=200, bbox_inches='tight')
+    plt.savefig("fig3_minimum_objective_history.png", dpi=220, bbox_inches='tight')
     plt.close()
 
-    print("Saved 3 standard figures:")
-    print(" - fig1_value_comparison.png")
-    print(" - fig2_control_comparison.png")
-    print(" - fig3_convergence.png")
+    print("Saved figures:")
+    print(" - fig1_value_comparison_inset.png")
+    print(" - fig2_control_comparison_inset.png")
+    print(" - fig3_minimum_objective_history.png")
+    print(f"Max abs value error         = {torch.max(v_abs_err).item():.6e}")
+    print(f"Mean abs value error        = {torch.mean(v_abs_err).item():.6e}")
+    print(f"Max abs control error (a1)  = {torch.max(a1_abs_err).item():.6e}")
+    print(f"Mean abs control error (a1) = {torch.mean(a1_abs_err).item():.6e}")
+    print(f"Max abs control error (a2)  = {torch.max(a2_abs_err).item():.6e}")
+    print(f"Mean abs control error (a2) = {torch.mean(a2_abs_err).item():.6e}")
 
 # =========================================================
-# 10. MAIN
+# 8. DGM-STYLE FIGURES
+# =========================================================
+def plot_dgm_style_results(trainer):
+    plt.figure(figsize=(8, 5))
+    plt.plot(trainer.value_epoch_hist, trainer.total_loss_hist, label='total loss')
+    plt.plot(trainer.value_epoch_hist, trainer.pde_loss_hist, label='PDE loss')
+    plt.plot(trainer.value_epoch_hist, trainer.terminal_loss_hist, label='terminal loss')
+    plt.yscale('log')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('EX4 PIA training loss')
+    plt.legend()
+    plt.grid(True, which='both')
+    plt.tight_layout()
+    plt.savefig("fig4_dgm_style_training_loss.png", dpi=220, bbox_inches='tight')
+    plt.close()
+
+    plt.figure(figsize=(8, 5))
+    err_plot = [max(v, 1e-12) for v in trainer.value_mae_hist]
+    plt.semilogy(trainer.error_eval_epoch_hist, err_plot, marker='o')
+    plt.xlabel('Epoch')
+    plt.ylabel('Mean absolute error vs Riccati')
+    plt.title('EX4 PIA error against Riccati benchmark')
+    plt.grid(True, which='both')
+    plt.tight_layout()
+    plt.savefig("fig5_dgm_style_value_error.png", dpi=220, bbox_inches='tight')
+    plt.close()
+
+    print("Saved DGM-style figures:")
+    print(" - fig4_dgm_style_training_loss.png")
+    print(" - fig5_dgm_style_value_error.png")
+
+# =========================================================
+# 9. MAIN
 # =========================================================
 if __name__ == "__main__":
     # problem parameters
@@ -517,15 +625,23 @@ if __name__ == "__main__":
 
     sigma = 0.3 * torch.eye(2, dtype=torch.float32, device=device)
 
-    # models
-    critic = Net(n_layer=3, n_hidden=128, dim=3).to(device)   # solve v(t,x)
-    actor = Actor(hidden_sizes=(64, 64)).to(device)            # solve a(t,x)
+    # only two neural networks:
+    # Net for value v(t,x)
+    critic = Net(n_layer=3, n_hidden=128, dim=3).to(device)
 
-    # Riccati benchmark
+    # FFN for control a(t,x)
+    actor = FFN(
+        sizes=[3, 64, 64, 2],
+        activation=nn.Tanh,
+        output_activation=nn.Identity,
+        batch_norm=False
+    ).to(device)
+
+    # exact benchmark
     ric = RiccatiSolver(H, M, C, D, R, sigma, T, device)
     ric.solve(N=4000)
 
-    # PIA object + trainer
+    # PIA
     pia = LQR_PIA(critic, actor, H, M, C, D, R, sigma, T, device)
     trainer = TrainPIA(critic, actor, pia, ric, device)
 
@@ -535,13 +651,12 @@ if __name__ == "__main__":
         value_steps=3000,
         policy_steps=1500,
         lr_v=0.002,
-        lr_a=0.001
+        lr_a=0.001,
+        eval_every=250
     )
 
-    # three standard figures
+    # standard figures
     plot_all_results(critic, actor, ric, trainer, device)
 
-    # optional value surface figures
-    # demo = DemoValue(critic, ric, T, nt=80, nx=80, x2_fixed=0.0, device=device)
-    # demo.get_solution()
-    # demo.plot_mesh()
+    # DGM-style figures
+    plot_dgm_style_results(trainer)
