@@ -1,9 +1,7 @@
 import torch
 class LQR:
 
-    # =====================================================
     # (i) Initialise the class with LQR model parameters
-    # =====================================================
     def __init__(self, H, M, C, D, R, sigma, T):
 
         self.H = H.float()
@@ -17,10 +15,7 @@ class LQR:
         # Precompute D^{-1}
         self.Dinv = torch.linalg.inv(self.D)
 
-
-    # =====================================================
     # (ii) Solve the Riccati ODE on a given time grid
-    # =====================================================
     def solve_riccati(self, t_grid):
 
         if not torch.is_tensor(t_grid):
@@ -63,10 +58,7 @@ class LQR:
 
         self.g = g
 
-
-    # =====================================================
     # Helper function: retrieve S(t) for given t
-    # =====================================================
     def get_S(self, t):
 
         if t.dim() == 0:
@@ -77,10 +69,7 @@ class LQR:
         idx = torch.argmin(diff, dim=0)
         return self.S[idx]
 
-
-    # =====================================================
     # Helper function: retrieve g(t) for given t
-    # =====================================================
     def get_g(self, t):
 
         if t.dim() == 0:
@@ -90,16 +79,13 @@ class LQR:
         diff = torch.abs(self.t_grid.unsqueeze(1) - t.unsqueeze(0))
         idx = torch.argmin(diff, dim=0)
         return self.g[idx]
-
-
-    # =====================================================
+    
     # (iii) Compute the value function v(t, x)
     # Input:
-    #   t: (batch,)
-    #   x: (batch, 1, 2)
+    # t: (batch,)
+    # x: (batch, 1, 2)
     # Output:
-    #   (batch, 1)
-    # =====================================================
+    # (batch, 1)
     def value_function(self, t, x):
 
         S = self.get_S(t)              # (batch, 2, 2)
@@ -111,16 +97,13 @@ class LQR:
         value = value.squeeze(-1)                # (batch, 1)
 
         return value + g.unsqueeze(1)
-
-
-    # =====================================================
+   
     # (iv) Compute the optimal control a(t, x)
     # Input:
-    #   t: (batch,)
-    #   X: (batch, 1, 2)
+    # t: (batch,)
+    # X: (batch, 1, 2)
     # Output:
-    #   (batch, 2)
-    # =====================================================
+    # (batch, 2)
     def optimal_control(self, t, X):
 
         S = self.get_S(t)
