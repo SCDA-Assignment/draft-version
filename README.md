@@ -30,6 +30,8 @@ The workflow follows:
 3. Solve PDE using Deep Galerkin Method (Exercise 3)
 4. Combine both into policy iteration (Exercise 4)
 
+Note: Since Monte Carlo simulations are used in parts of the implementation, the results are inherently stochastic. Therefore, the generated figures may exhibit slight variations across different runs. However, the overall trends and conclusions remain consistent.
+
 ---
 
 ## 3. Requirements
