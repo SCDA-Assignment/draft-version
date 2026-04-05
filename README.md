@@ -52,25 +52,23 @@ pip install numpy scipy matplotlib torch
 ---
 
 ## 4. File Structure
-Markdown
 
-lib/                        # helper modules (networks, utilities)
+lib/                        
 
 EX.1_1.py                   # Riccati solver (Exercise 1.1)
 EX.1_2.ipynb                # Monte Carlo verification (Exercise 1.2)
 
 EX.2_1&2_2.ipynb            # Supervised learning (value + control)
 
-EX.3.ipynb                  # Deep Galerkin method (linear PDE)
+EX.3.ipynb                  # Deep Galerkin method 
 
-EX.4.ipynb                  # Policy iteration (main task)
+EX.4.ipynb                  # Policy iteration 
 
-fig1_value_comparison.png   # value function comparison
-fig2_control_comparison.png # control comparison
+fig1_value_comparison.png   
+fig2_control_comparison.png 
 fig3_minimum_objective_history.png
 fig4_dgm_style_training_loss.png
 fig5_dgm_style_value_error.png
-Markdown
 
 ---
 
@@ -97,7 +95,7 @@ This will:
 
 ### Exercise 2
 
-Run:
+Open and run:
 EX.2_1&2_2.ipynb
 
 
@@ -112,7 +110,7 @@ This will:
 
 ### Exercise 3
 
-Run:
+Open and run:
 EX.3.ipynb
 
 
@@ -129,7 +127,7 @@ This will:
 
 ### Exercise 4 (Main Results)
 
-Run:
+Open and run:
 EX.4.ipynb
 
 
