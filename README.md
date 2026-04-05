@@ -47,8 +47,7 @@ Install dependencies (if needed):
 
 ```bash
 pip install numpy scipy matplotlib torch
-
----
+```
 
 ---
 
