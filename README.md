@@ -9,6 +9,9 @@
 - Name 2: Liyi Li (Student ID: s2905691)  
 - Name 3: Xinyue Zhao (Student ID: s2846397)  
 
+Contribution:
+- Default equal contribution (1/3 each)  
+
 ---
 
 ## 2. Overview
@@ -54,9 +57,15 @@ lib/
 EX.1_1.py                   # Riccati solver (Exercise 1.1)
 EX.1_2.ipynb                # Monte Carlo verification (Exercise 1.2)
 
+EX1.2_error_vs_monte_carlo_samples.png
+EX1.2_error_vs_time_discretisation.png
+
 EX.2_1&2_2.ipynb            # Supervised learning (value + control)
 
 EX.3.ipynb                  # Deep Galerkin method 
+
+EX3_mc_error.png
+EX3_training_loss.png
 
 EX.4.ipynb                  # Policy iteration 
 
